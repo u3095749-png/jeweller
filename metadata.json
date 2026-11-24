@@ -1,0 +1,8 @@
+{
+  "name": "Zaveri Atelier",
+  "description": "Luxury Pakistani fine jewellery maison featuring 22K gold, Polki Kundan, and heirloom bridal collections priced in PKR with direct WhatsApp concierge ordering.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
