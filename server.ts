@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import './server/loadEnv.ts';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';

@@ -35,18 +35,23 @@ export async function safeReadJson<T = Record<string, unknown>>(
     }
   }
 
+  if (res.status === 400) {
+    throw new Error(
+      `${contextLabel} request could not be processed (HTTP 400). Please check your input or API key configuration.`
+    );
+  }
   if (res.status === 404 || /page could not be found/i.test(trimmed)) {
     throw new Error(
-      `The AI service endpoint could not be reached (HTTP 404). Please redeploy the latest backend API configuration and verify GEMINI_API_KEY is set.`
+      `The AI service endpoint could not be reached (HTTP 404). Please verify the backend API route and GEMINI_API_KEY configuration.`
     );
   }
   if (res.status === 401 || res.status === 403) {
     throw new Error(
-      `Server authorization failed (HTTP ${res.status}). Please check your API key configuration.`
+      `Server authorization failed (HTTP ${res.status}). Please check GEMINI_API_KEY in .env.local or Settings > Secrets.`
     );
   }
   if (res.status === 429) {
-    throw new Error('The AI service is receiving high traffic right now. Please wait a moment and retry.');
+    throw new Error('The AI service is receiving high traffic right now (HTTP 429). Please wait a moment and retry.');
   }
   if (looksLikeHtml || res.status >= 500) {
     throw new Error(

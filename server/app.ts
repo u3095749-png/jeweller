@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import { loadServerEnv } from './loadEnv.ts';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -158,8 +158,8 @@ const VALID_FINISHES = new Set<MetalFinishKey>([
 const ttsCache = new Map<string, string>();
 const MAX_TTS_CACHE = 40;
 
-function getGeminiApiKey(): string | null {
-  let apiKey = (process.env.GEMINI_API_KEY || '').trim();
+function normalizeEnvKeyValue(raw: string | undefined): string {
+  let apiKey = (raw || '').trim();
   if (
     apiKey.length >= 2 &&
     ((apiKey.startsWith('"') && apiKey.endsWith('"')) ||
@@ -167,10 +167,24 @@ function getGeminiApiKey(): string | null {
   ) {
     apiKey = apiKey.slice(1, -1).trim();
   }
-  if (!apiKey || /^(my_gemini_|mypi_key|your_gemini_|replace_with_)/i.test(apiKey)) {
-    return null;
+  if (!apiKey || /^(my_gemini_|mypi_key|your_gemini_|replace_with_|changeme)/i.test(apiKey)) {
+    return '';
   }
   return apiKey;
+}
+
+function getGeminiApiKey(): string | null {
+  loadServerEnv();
+  const candidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+  ];
+  for (const candidate of candidates) {
+    const clean = normalizeEnvKeyValue(candidate);
+    if (clean) return clean;
+  }
+  return null;
 }
 
 function getAiClient(): GoogleGenAI | null {
@@ -565,22 +579,64 @@ function sanitizePayload(
   };
 }
 
-async function callWithRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+function extractGeminiErrorDetails(err: unknown): {
+  status: number;
+  message: string;
+  apiStatusText: string;
+} {
+  let message = err instanceof Error ? err.message : String(err);
+  let status =
+    typeof err === 'object' && err !== null && 'status' in err
+      ? Number((err as { status?: number }).status)
+      : typeof err === 'object' && err !== null && 'statusCode' in err
+      ? Number((err as { statusCode?: number }).statusCode)
+      : 0;
+  let apiStatusText = '';
+
+  // Parse nested JSON payloads thrown by @google/genai inside Error.message
+  const jsonStart = message.indexOf('{');
+  if (jsonStart >= 0) {
+    try {
+      const parsed = JSON.parse(message.slice(jsonStart)) as {
+        error?: { code?: number; message?: string; status?: string };
+      };
+      if (parsed?.error) {
+        if (!status && typeof parsed.error.code === 'number') {
+          status = parsed.error.code;
+        }
+        if (typeof parsed.error.status === 'string') {
+          apiStatusText = parsed.error.status;
+        }
+        if (typeof parsed.error.message === 'string' && parsed.error.message.trim()) {
+          message = parsed.error.message.trim();
+        }
+      }
+    } catch {
+      // Non-JSON error message; continue with original status/message
+    }
+  }
+
+  return {
+    status: Number.isFinite(status) ? status : 0,
+    message,
+    apiStatusText,
+  };
+}
+
+async function callWithRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
   let attempt = 0;
   while (true) {
     try {
       return await fn();
     } catch (err: unknown) {
-      const status =
-        typeof err === 'object' && err !== null && 'status' in err
-          ? Number((err as { status?: number }).status)
-          : 0;
-      const msg = err instanceof Error ? err.message : String(err);
+      const { status, message, apiStatusText } = extractGeminiErrorDetails(err);
       const isTransient =
         status === 429 ||
         status === 502 ||
         status === 503 ||
-        /RESOURCE_EXHAUSTED|UNAVAILABLE|overloaded|ECONNRESET|ETIMEDOUT/i.test(msg);
+        /RESOURCE_EXHAUSTED|UNAVAILABLE|overloaded|ECONNRESET|ETIMEDOUT/i.test(
+          `${apiStatusText} ${message}`
+        );
 
       if (attempt < maxRetries && isTransient) {
         const delayMs = 600 * Math.pow(2, attempt);
@@ -594,43 +650,53 @@ async function callWithRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T
 }
 
 function handleGeminiError(res: express.Response, err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  const status =
-    typeof err === 'object' && err !== null && 'status' in err
-      ? Number((err as { status?: number }).status)
-      : 500;
+  const { status, message, apiStatusText } = extractGeminiErrorDetails(err);
+  const combined = `${apiStatusText} ${message}`;
 
-  if (
-    status === 401 ||
-    status === 403 ||
-    /PERMISSION_DENIED|API_KEY_INVALID|API key not valid/i.test(msg)
-  ) {
-    res.status(status === 401 ? 401 : 403).json({
+  if (status === 401 || /UNAUTHENTICATED/i.test(combined)) {
+    res.status(401).json({
       error:
-        'Gemini API key permission denied or invalid. Check GEMINI_API_KEY in Settings > Secrets or Vercel Environment Variables and redeploy.',
+        'Gemini API authentication failed (401). Check GEMINI_API_KEY in .env.local or Settings > Secrets.',
     });
     return;
   }
-  if (status === 429 || /RESOURCE_EXHAUSTED|quota/i.test(msg)) {
+  if (status === 403 || /PERMISSION_DENIED/i.test(combined)) {
+    res.status(403).json({
+      error:
+        'Gemini API permission denied (403). Verify GEMINI_API_KEY in .env.local or Settings > Secrets.',
+    });
+    return;
+  }
+  if (status === 400 || /INVALID_ARGUMENT|API_KEY_INVALID|API key not valid/i.test(combined)) {
+    const isInvalidKey = /API_KEY_INVALID|API key not valid/i.test(combined);
+    res.status(400).json({
+      error: isInvalidKey
+        ? 'The configured GEMINI_API_KEY is invalid (400). Check your key in .env.local or Settings > Secrets.'
+        : `Invalid request sent to Gemini AI (400): ${message || 'Please check your input and try again.'}`,
+    });
+    return;
+  }
+  if (status === 404 || /NOT_FOUND/i.test(combined)) {
+    res.status(404).json({
+      error:
+        'Requested Gemini AI model or API endpoint could not be reached (404). Verify the model name and backend route configuration.',
+    });
+    return;
+  }
+  if (status === 429 || /RESOURCE_EXHAUSTED|quota|rate limit/i.test(combined)) {
     res.status(429).json({
-      error: 'Assistant rate limit reached. Please wait a moment and try again.',
+      error: 'Assistant rate limit or quota reached (429). Please wait a moment and try again.',
     });
     return;
   }
-  if (status === 503 || /UNAVAILABLE|overloaded/i.test(msg)) {
+  if (status === 503 || /UNAVAILABLE|overloaded/i.test(combined)) {
     res.status(503).json({
       error: 'Gemini AI is momentarily busy (503). Please try sending your message again.',
     });
     return;
   }
-  if (status === 404 || /NOT_FOUND/i.test(msg)) {
-    res.status(404).json({
-      error: 'Requested AI model could not be reached. Please verify server configuration.',
-    });
-    return;
-  }
   res.status(status >= 400 && status < 600 ? status : 500).json({
-    error: msg || 'Failed to contact the AI service.',
+    error: message || 'Failed to contact the AI service.',
   });
 }
 
@@ -663,6 +729,7 @@ export async function createApiApp() {
       ok: true,
       brand: STORE_CONFIG.brandName,
       geminiConfigured: Boolean(getGeminiApiKey()),
+      model: 'gemini-4-hydrogen',
     });
   });
 
@@ -1385,7 +1452,8 @@ export async function createApiApp() {
     const ai = getAiClient();
     if (!ai) {
       res.status(500).json({
-        error: 'Gemini API key is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
+        error:
+          'Gemini API key is not configured. Add GEMINI_API_KEY in .env.local or Settings > Secrets.',
       });
       return;
     }
@@ -1442,7 +1510,8 @@ export async function createApiApp() {
     const ai = getAiClient();
     if (!ai) {
       res.status(500).json({
-        error: 'Gemini API key is not configured. Please add GEMINI_API_KEY in Settings > Secrets.',
+        error:
+          'Gemini API key is not configured. Add GEMINI_API_KEY in .env.local or Settings > Secrets.',
       });
       return;
     }
@@ -1510,7 +1579,7 @@ export async function createApiApp() {
     if (!ai) {
       res.status(500).json({
         error:
-          'Gemini API key is not configured. Please add GEMINI_API_KEY in the Settings > Secrets panel.',
+          'Gemini API key is not configured. Add GEMINI_API_KEY in .env.local or Settings > Secrets.',
       });
       return;
     }
